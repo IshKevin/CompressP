@@ -61,6 +61,8 @@ FILE_ROUTE = re.compile(r"^/api/files/([0-9a-f]{32})$")
 UPLOAD_ROUTE = re.compile(r"^/api/uploads/([0-9a-f]{32})$")
 CHUNK_ROUTE = re.compile(r"^/api/uploads/([0-9a-f]{32})/chunks/(\d+)$")
 COMPLETE_ROUTE = re.compile(r"^/api/uploads/([0-9a-f]{32})/complete$")
+ABORT_ROUTE = re.compile(r"^/api/uploads/([0-9a-f]{32})/abort$")
+FILE_DELETE_ROUTE = re.compile(r"^/api/files/([0-9a-f]{32})/delete$")
 
 STATIC_FILES = {
     "/static/app.js": ("app.js", "application/javascript; charset=utf-8"),
@@ -487,6 +489,17 @@ class Handler(BaseHTTPRequestHandler):
         m = COMPLETE_ROUTE.match(path)
         if m:
             return self._complete_upload(m.group(1))
+        # POST versions of the part/abort/delete calls. Some proxies don't pass
+        # PUT and DELETE through, so the browser uses these instead.
+        m = CHUNK_ROUTE.match(path)
+        if m:
+            return self._put_chunk(m.group(1), int(m.group(2)))
+        m = ABORT_ROUTE.match(path)
+        if m:
+            return self._abort_upload(m.group(1))
+        m = FILE_DELETE_ROUTE.match(path)
+        if m:
+            return self._delete_file(m.group(1))
         self._error(404, "Not found")
 
     def do_PUT(self):
@@ -505,29 +518,33 @@ class Handler(BaseHTTPRequestHandler):
 
         m = UPLOAD_ROUTE.match(path)
         if m:
-            uid = m.group(1)
-            with _upload_lock:
-                state = load_upload(uid)
-                if state is None or state.get("completed"):
-                    return self._error(404, "Upload not found")
-                remove_upload(uid)
-            return self._json(200, {"ok": True})
+            return self._abort_upload(m.group(1))
 
         m = FILE_ROUTE.match(path)
         if m:
-            file_id = m.group(1)
-            with _index_lock:
-                index = load_index()
-                if file_id not in index:
-                    return self._error(404, "File not found")
-                del index[file_id]
-                save_index(index)
-            disk_path = os.path.join(FILES_DIR, file_id)
-            if os.path.exists(disk_path):
-                os.remove(disk_path)
-            return self._json(200, {"ok": True})
+            return self._delete_file(m.group(1))
 
         self._error(404, "Not found")
+
+    def _abort_upload(self, uid):
+        with _upload_lock:
+            state = load_upload(uid)
+            if state is None or state.get("completed"):
+                return self._error(404, "Upload not found")
+            remove_upload(uid)
+        self._json(200, {"ok": True})
+
+    def _delete_file(self, file_id):
+        with _index_lock:
+            index = load_index()
+            if file_id not in index:
+                return self._error(404, "File not found")
+            del index[file_id]
+            save_index(index)
+        disk_path = os.path.join(FILES_DIR, file_id)
+        if os.path.exists(disk_path):
+            os.remove(disk_path)
+        self._json(200, {"ok": True})
 
     # ----- login -----
 
@@ -569,8 +586,6 @@ class Handler(BaseHTTPRequestHandler):
         path = validate_path(body.get("path") or body.get("name"))
         if path is None:
             return self._error(400, "Invalid file name or path")
-        if not path.lower().endswith(".zip"):
-            return self._error(400, "Only .zip files can be uploaded")
 
         if DISK_RESERVE_BYTES and size + DISK_RESERVE_BYTES > shutil.disk_usage(DATA_DIR).free:
             return self._error(507, "Not enough free disk space on the server for this file")

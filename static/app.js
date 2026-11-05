@@ -148,8 +148,8 @@
 
   async function deleteFile(file) {
     if (!confirm('Delete "' + (file.path || file.name) + '"? This cannot be undone.')) return;
-    const res = await fetch("/api/files/" + encodeURIComponent(file.id), {
-      method: "DELETE",
+    const res = await fetch("/api/files/" + encodeURIComponent(file.id) + "/delete", {
+      method: "POST",
       credentials: "same-origin",
     });
     if (res.status === 401) return showLogin("Your session expired. Please log in again.");
@@ -188,7 +188,7 @@
 
   async function discardUpload(uploadId) {
     if (!confirm("Discard this unfinished upload? Parts already sent will be deleted.")) return;
-    await fetch("/api/uploads/" + uploadId, { method: "DELETE", credentials: "same-origin" });
+    await fetch("/api/uploads/" + uploadId + "/abort", { method: "POST", credentials: "same-origin" });
     loadUnfinished();
   }
 
@@ -293,7 +293,7 @@
       const checksum = await sha256Hex(part);
       if (checksum) headers["X-Chunk-SHA256"] = checksum;
       await requestWithRetry("/api/uploads/" + uploadId + "/chunks/" + i, {
-        method: "PUT",
+        method: "POST",
         headers,
         body: part,
       });
@@ -320,21 +320,9 @@
     event.returnValue = "";
   }
 
-  function isZip(file) {
-    return file.name.toLowerCase().endsWith(".zip");
-  }
-
   async function uploadFiles(fileList) {
-    const all = Array.from(fileList || []);
-    if (!all.length || uploading) return;
-    const files = all.filter(isZip);
-    if (files.length < all.length) {
-      alert("Only .zip files can be uploaded. " + (all.length - files.length) + " file(s) were skipped.");
-    }
-    if (!files.length) {
-      fileInput.value = "";
-      return;
-    }
+    const files = Array.from(fileList || []);
+    if (!files.length || uploading) return;
     uploading = true;
     window.addEventListener("beforeunload", beforeUnload);
     try {

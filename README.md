@@ -1,13 +1,13 @@
 # File Store
 
 A small, password-protected web app for storing files on your server while you
-reinstall your PC. Log in, upload your files (zip folders first), and download
+reinstall your PC. Log in, upload your files, and download
 them back later.
 
 - No third-party Python packages (standard library only)
 - Large files (tested in chunks up to hundreds of GB) upload in parts that resume after a dropped connection
 - Downloads resume after an interruption (HTTP Range)
-- Upload whole folders directly, no zip step needed
+- Any file type can be uploaded. Zip a folder first to keep it as one file.
 - Files are stored byte-for-byte as uploaded, with their names and folder paths unchanged
 - Every part is checksum-verified, and each stored file gets a SHA-256 you can compare with your PC
 - The password comes from an environment variable, never from the code
