@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
-"""Small single-user file storage server.
+"""Single-user file storage server. Standard library only.
 
-Standard library only (no third-party packages), so the Docker image stays small.
+Large files are uploaded in chunks. Each chunk is its own request, so a dropped
+connection only costs one chunk, and the upload resumes where it stopped.
+Downloads support HTTP Range requests, so interrupted downloads can resume too.
 
-Configuration is read from environment variables:
-  APP_PASSWORD      (required) password for the web UI, at least 8 characters
-  SESSION_SECRET    optional key for signing login cookies; random per start if unset
-  MAX_UPLOAD_MB     maximum size of one uploaded file in MB (default 5120)
-  COOKIE_SECURE     set to 1 when served over HTTPS (default 0)
-  SESSION_TTL_HOURS how long a login lasts (default 12)
-  DATA_DIR          where files and the index are stored (default ./data)
-  PORT              port to listen on inside the container (default 8080)
+Environment variables:
+  APP_PASSWORD       (required) password for the web UI, at least 8 characters
+  SESSION_SECRET     optional fixed key for login cookies; random per start if unset
+  COOKIE_SECURE      1 when served over HTTPS (default 0)
+  SESSION_TTL_HOURS  logout after this many idle hours; resets on each request (default 12)
+  MAX_FILE_GB        largest allowed single file in GB, 0 = no limit (default 0)
+  CHUNK_MB           upload chunk size in MB (default 64)
+  DISK_RESERVE_GB    if above 0, refuse uploads that would leave less than this free (default 0)
+  DATA_DIR           where files and state are stored (default ./data)
+  PORT               port to listen on inside the container (default 8080)
 """
 
+import errno
 import hashlib
 import hmac
 import json
@@ -26,49 +31,147 @@ import time
 import uuid
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import quote, unquote, urlsplit
+from urllib.parse import quote, urlsplit
+
+GB = 1024 ** 3
+MB = 1024 ** 2
+IO_BLOCK = 1024 * 1024
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 DATA_DIR = os.environ.get("DATA_DIR", os.path.join(BASE_DIR, "data"))
 FILES_DIR = os.path.join(DATA_DIR, "files")
+UPLOADS_DIR = os.path.join(DATA_DIR, "uploads")
 INDEX_PATH = os.path.join(DATA_DIR, "index.json")
 
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
 SECRET_KEY = os.environ.get("SESSION_SECRET") or secrets.token_hex(32)
-MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_MB", "5120")) * 1024 * 1024
 COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "0") == "1"
 SESSION_TTL = int(os.environ.get("SESSION_TTL_HOURS", "12")) * 3600
+MAX_FILE_BYTES = int(os.environ.get("MAX_FILE_GB", "0")) * GB
+CHUNK_BYTES = int(os.environ.get("CHUNK_MB", "64")) * MB
+DISK_RESERVE_BYTES = int(os.environ.get("DISK_RESERVE_GB", "0")) * GB  # 0 = don't check space
+STALE_UPLOAD_SECONDS = 72 * 3600
 PORT = int(os.environ.get("PORT", "8080"))
 
 LOGIN_MAX_FAILURES = 5
 LOGIN_WINDOW = 15 * 60
-CHUNK = 1024 * 1024
-ID_RE = re.compile(r"^[0-9a-f]{32}$")
+
+FILE_ROUTE = re.compile(r"^/api/files/([0-9a-f]{32})$")
+UPLOAD_ROUTE = re.compile(r"^/api/uploads/([0-9a-f]{32})$")
+CHUNK_ROUTE = re.compile(r"^/api/uploads/([0-9a-f]{32})/chunks/(\d+)$")
+COMPLETE_ROUTE = re.compile(r"^/api/uploads/([0-9a-f]{32})/complete$")
+
 STATIC_FILES = {
     "/static/app.js": ("app.js", "application/javascript; charset=utf-8"),
     "/static/style.css": ("style.css", "text/css; charset=utf-8"),
 }
 
 _index_lock = threading.Lock()
+_upload_lock = threading.Lock()
 _login_lock = threading.Lock()
 _failures = {}  # client ip -> [failure_count, window_start]
 
 
-# ---------- file index ----------
+# ---------- storage helpers ----------
+
+def _read_json(path):
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _write_json_atomic(path, obj):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f)
+    os.replace(tmp, path)
+
 
 def load_index():
     if not os.path.exists(INDEX_PATH):
         return {}
-    with open(INDEX_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
+    return _read_json(INDEX_PATH)
 
 
 def save_index(index):
-    tmp = INDEX_PATH + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(index, f, indent=2)
-    os.replace(tmp, INDEX_PATH)
+    _write_json_atomic(INDEX_PATH, index)
+
+
+def upload_state_path(uid):
+    return os.path.join(UPLOADS_DIR, uid + ".json")
+
+
+def part_path(uid):
+    return os.path.join(FILES_DIR, uid + ".part")
+
+
+def load_upload(uid):
+    try:
+        return _read_json(upload_state_path(uid))
+    except FileNotFoundError:
+        return None
+
+
+def save_upload(state):
+    _write_json_atomic(upload_state_path(state["upload_id"]), state)
+
+
+def remove_upload(uid):
+    for path in (part_path(uid), upload_state_path(uid)):
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+
+
+def sha256_of(path):
+    """Read a file back and return its SHA-256 hex digest (flushed to disk first)."""
+    digest = hashlib.sha256()
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+        with os.fdopen(os.dup(fd), "rb") as f:
+            for block in iter(lambda: f.read(IO_BLOCK * 4), b""):
+                digest.update(block)
+    finally:
+        os.close(fd)
+    return digest.hexdigest()
+
+
+def total_chunks(size, chunk_size):
+    return -(-size // chunk_size) if size > 0 else 0
+
+
+def expected_chunk_len(state, index):
+    start = index * state["chunk_size"]
+    return min(state["chunk_size"], state["size"] - start)
+
+
+def upload_view(state):
+    return {
+        "upload_id": state["upload_id"],
+        "path": state["path"],
+        "size": state["size"],
+        "chunk_size": state["chunk_size"],
+        "total_chunks": total_chunks(state["size"], state["chunk_size"]),
+        "received": sorted(state["received"]),
+    }
+
+
+def cleanup_stale_uploads():
+    """Delete unfinished uploads that have been idle for 72 hours."""
+    cutoff = time.time() - STALE_UPLOAD_SECONDS
+    with _upload_lock:
+        for name in os.listdir(UPLOADS_DIR):
+            if not name.endswith(".json"):
+                continue
+            uid = name[:-5]
+            try:
+                state = _read_json(os.path.join(UPLOADS_DIR, name))
+            except (OSError, ValueError):
+                continue
+            if state.get("updated", 0) < cutoff:
+                remove_upload(uid)
 
 
 # ---------- auth ----------
@@ -80,6 +183,13 @@ def _sign(payload):
 def make_session_token():
     expires = str(int(time.time()) + SESSION_TTL)
     return f"{expires}.{_sign(expires)}"
+
+
+def session_cookie(token):
+    value = (
+        f"session={token}; Path=/; Max-Age={SESSION_TTL}; HttpOnly; SameSite=Strict"
+    )
+    return value + ("; Secure" if COOKIE_SECURE else "")
 
 
 def valid_session_token(token):
@@ -125,12 +235,23 @@ def clear_login_failures(ip):
         _failures.pop(ip, None)
 
 
-# ---------- helpers ----------
+# ---------- names ----------
 
-def clean_filename(raw):
-    name = os.path.basename(raw.replace("\\", "/"))
-    name = re.sub(r"[\x00-\x1f\x7f]", "", name).strip().strip(".")
-    return name[:200] or "file"
+def validate_path(raw):
+    """Return the name/relative path exactly as given, or None if it is unsafe.
+
+    Names are never changed. Paths that could be misread (empty parts, "..",
+    absolute paths, control characters, backslashes) are rejected instead.
+    """
+    if not isinstance(raw, str) or not raw or len(raw) > 1024:
+        return None
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in raw) or "\\" in raw:
+        return None
+    if raw.startswith("/"):
+        return None
+    if any(part in ("", ".", "..") for part in raw.split("/")):
+        return None
+    return raw
 
 
 def content_disposition(name):
@@ -141,12 +262,13 @@ def content_disposition(name):
 class Handler(BaseHTTPRequestHandler):
     server_version = "FileStore"
     sys_version = ""
-    timeout = 300  # drop stalled connections after 5 minutes of silence
+    timeout = 300  # drop connections that stay silent for 5 minutes
+    _renewed_token = None
 
     def log_message(self, fmt, *args):
         sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
 
-    # -- response helpers --
+    # ----- responses -----
 
     def _base_headers(self):
         self.send_header("X-Content-Type-Options", "nosniff")
@@ -157,50 +279,104 @@ class Handler(BaseHTTPRequestHandler):
             "default-src 'self'; style-src 'self'; script-src 'self'; "
             "img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'",
         )
+        if self._renewed_token:
+            self.send_header("Set-Cookie", session_cookie(self._renewed_token))
 
     def _json(self, status, obj, extra_headers=None):
         body = json.dumps(obj).encode("utf-8")
-        self.send_response(status)
-        self._base_headers()
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        for k, v in (extra_headers or []):
-            self.send_header(k, v)
-        self.end_headers()
         try:
+            self.send_response(status)
+            self._base_headers()
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            for k, v in (extra_headers or []):
+                self.send_header(k, v)
+            self.end_headers()
             self.wfile.write(body)
         except (BrokenPipeError, ConnectionResetError):
-            pass  # client went away; nothing to do
+            pass  # client went away
 
     def _error(self, status, message):
-        # The request body may be unread, so don't reuse this connection.
+        # The request body may be unread, so the connection can't be reused.
         self.close_connection = True
         self._json(status, {"error": message})
 
-    def _send_file(self, path, content_type, download_name=None):
+    def _send_stored_file(self, path, download_name):
+        """Send a file, honouring a single HTTP Range header for resumable downloads."""
         size = os.path.getsize(path)
-        self.send_response(200)
-        self._base_headers()
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(size))
-        self.send_header("Cache-Control", "no-store")
-        if download_name:
-            self.send_header("Content-Disposition", content_disposition(download_name))
-        self.end_headers()
-        with open(path, "rb") as f:
-            shutil.copyfileobj(f, self.wfile, CHUNK)
+        start, end, status = 0, size - 1, 200
+        range_header = self.headers.get("Range")
+        if range_header and size > 0:
+            m = re.fullmatch(r"bytes=(\d*)-(\d*)", range_header.strip())
+            if not m or (not m.group(1) and not m.group(2)):
+                return self._range_not_satisfiable(size)
+            if m.group(1):
+                start = int(m.group(1))
+                end = int(m.group(2)) if m.group(2) else size - 1
+            else:
+                start = max(0, size - int(m.group(2)))
+            end = min(end, size - 1)
+            if start >= size or start > end:
+                return self._range_not_satisfiable(size)
+            status = 206
 
-    # -- request checks --
+        length = end - start + 1 if size > 0 else 0
+        try:
+            self.send_response(status)
+            self._base_headers()
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Length", str(length))
+            self.send_header("Cache-Control", "no-store")
+            if status == 206:
+                self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+            if download_name:
+                self.send_header("Content-Disposition", content_disposition(download_name))
+            self.end_headers()
+            with open(path, "rb") as f:
+                f.seek(start)
+                remaining = length
+                while remaining > 0:
+                    buf = f.read(min(IO_BLOCK, remaining))
+                    if not buf:
+                        break
+                    self.wfile.write(buf)
+                    remaining -= len(buf)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def _range_not_satisfiable(self, size):
+        self.close_connection = True
+        self._json(416, {"error": "Invalid range"}, [("Content-Range", f"bytes */{size}")])
+
+    def _read_body_json(self, limit=4096):
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            return None
+        if length <= 0 or length > limit:
+            return None
+        try:
+            data = json.loads(self.rfile.read(length))
+        except (ValueError, UnicodeDecodeError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    # ----- auth checks -----
 
     def _is_authed(self):
-        raw = self.headers.get("Cookie", "")
         jar = SimpleCookie()
         try:
-            jar.load(raw)
+            jar.load(self.headers.get("Cookie", ""))
         except Exception:
             return False
         morsel = jar.get("session")
-        return bool(morsel and valid_session_token(morsel.value))
+        if not morsel or not valid_session_token(morsel.value):
+            return False
+        # Sliding expiry: every request renews the session, so a long upload
+        # doesn't log you out halfway through.
+        self._renewed_token = make_session_token()
+        return True
 
     def _same_origin(self):
         origin = self.headers.get("Origin")
@@ -217,13 +393,7 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return True
 
-    def _file_id_from_path(self, path):
-        if not path.startswith("/api/files/"):
-            return None
-        file_id = path[len("/api/files/"):]
-        return file_id if ID_RE.match(file_id) else None
-
-    # -- routes --
+    # ----- routes -----
 
     def do_GET(self):
         path = urlsplit(self.path).path
@@ -242,19 +412,44 @@ class Handler(BaseHTTPRequestHandler):
             if not self._require_auth():
                 return
             with _index_lock:
-                items = sorted(load_index().values(), key=lambda m: m["uploaded_at"], reverse=True)
+                items = list(load_index().values())
+            items.sort(key=lambda m: m.get("path", m["name"]).lower())
             return self._json(200, {"files": items})
 
-        file_id = self._file_id_from_path(path)
-        if file_id:
+        if path == "/api/uploads":
+            if not self._require_auth():
+                return
+            uploads = []
+            for name in os.listdir(UPLOADS_DIR):
+                if not name.endswith(".json"):
+                    continue
+                try:
+                    state = _read_json(os.path.join(UPLOADS_DIR, name))
+                except (OSError, ValueError):
+                    continue
+                if not state.get("completed"):
+                    uploads.append(upload_view(state))
+            return self._json(200, {"uploads": uploads})
+
+        m = UPLOAD_ROUTE.match(path)
+        if m:
+            if not self._require_auth():
+                return
+            state = load_upload(m.group(1))
+            if state is None or state.get("completed"):
+                return self._error(404, "Upload not found")
+            return self._json(200, upload_view(state))
+
+        m = FILE_ROUTE.match(path)
+        if m:
             if not self._require_auth():
                 return
             with _index_lock:
-                meta = load_index().get(file_id)
-            disk_path = os.path.join(FILES_DIR, file_id)
+                meta = load_index().get(m.group(1))
+            disk_path = os.path.join(FILES_DIR, m.group(1))
             if not meta or not os.path.isfile(disk_path):
                 return self._error(404, "File not found")
-            return self._send_file(disk_path, "application/octet-stream", meta["name"])
+            return self._send_stored_file(disk_path, meta["name"])
 
         self._error(404, "Not found")
 
@@ -262,7 +457,17 @@ class Handler(BaseHTTPRequestHandler):
         full = os.path.join(STATIC_DIR, filename)
         if not os.path.isfile(full):
             return self._error(404, "Not found")
-        self._send_file(full, content_type)
+        with open(full, "rb") as f:
+            body = f.read()
+        try:
+            self.send_response(200)
+            self._base_headers()
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def do_POST(self):
         path = urlsplit(self.path).path
@@ -275,7 +480,56 @@ class Handler(BaseHTTPRequestHandler):
                 200, {"ok": True},
                 [("Set-Cookie", "session=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict")],
             )
+        if not self._require_auth():
+            return
+        if path == "/api/uploads":
+            return self._create_upload()
+        m = COMPLETE_ROUTE.match(path)
+        if m:
+            return self._complete_upload(m.group(1))
         self._error(404, "Not found")
+
+    def do_PUT(self):
+        path = urlsplit(self.path).path
+        m = CHUNK_ROUTE.match(path)
+        if not m:
+            return self._error(404, "Not found")
+        if not self._require_auth():
+            return
+        self._put_chunk(m.group(1), int(m.group(2)))
+
+    def do_DELETE(self):
+        path = urlsplit(self.path).path
+        if not self._require_auth():
+            return
+
+        m = UPLOAD_ROUTE.match(path)
+        if m:
+            uid = m.group(1)
+            with _upload_lock:
+                state = load_upload(uid)
+                if state is None or state.get("completed"):
+                    return self._error(404, "Upload not found")
+                remove_upload(uid)
+            return self._json(200, {"ok": True})
+
+        m = FILE_ROUTE.match(path)
+        if m:
+            file_id = m.group(1)
+            with _index_lock:
+                index = load_index()
+                if file_id not in index:
+                    return self._error(404, "File not found")
+                del index[file_id]
+                save_index(index)
+            disk_path = os.path.join(FILES_DIR, file_id)
+            if os.path.exists(disk_path):
+                os.remove(disk_path)
+            return self._json(200, {"ok": True})
+
+        self._error(404, "Not found")
+
+    # ----- login -----
 
     def _login(self):
         ip = self.client_address[0]
@@ -284,17 +538,10 @@ class Handler(BaseHTTPRequestHandler):
         if login_blocked(ip):
             return self._error(429, "Too many failed attempts. Try again in 15 minutes.")
 
-        try:
-            length = int(self.headers.get("Content-Length", "0"))
-        except ValueError:
+        data = self._read_body_json()
+        if data is None:
             return self._error(400, "Bad request")
-        if length <= 0 or length > 4096:
-            return self._error(400, "Bad request")
-        try:
-            data = json.loads(self.rfile.read(length) or b"{}")
-            candidate = str(data.get("password", ""))
-        except (ValueError, AttributeError):
-            return self._error(400, "Bad request")
+        candidate = str(data.get("password", ""))
 
         if not password_ok(candidate):
             record_login_failure(ip)
@@ -302,18 +549,62 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(401, "Wrong password")
 
         clear_login_failures(ip)
-        cookie = (
-            f"session={make_session_token()}; Path=/; Max-Age={SESSION_TTL}; "
-            f"HttpOnly; SameSite=Strict" + ("; Secure" if COOKIE_SECURE else "")
-        )
-        self._json(200, {"ok": True}, [("Set-Cookie", cookie)])
+        self._json(200, {"ok": True}, [("Set-Cookie", session_cookie(make_session_token()))])
 
-    def do_PUT(self):
-        path = urlsplit(self.path).path
-        if path != "/api/files":
-            return self._error(404, "Not found")
-        if not self._require_auth():
-            return
+    # ----- chunked uploads -----
+
+    def _create_upload(self):
+        body = self._read_body_json()
+        if body is None:
+            return self._error(400, "Bad request")
+        try:
+            size = int(body.get("size"))
+        except (TypeError, ValueError):
+            return self._error(400, "Size is required")
+        if size < 0:
+            return self._error(400, "Bad size")
+        if MAX_FILE_BYTES and size > MAX_FILE_BYTES:
+            return self._error(413, "File is larger than the allowed limit")
+
+        path = validate_path(body.get("path") or body.get("name"))
+        if path is None:
+            return self._error(400, "Invalid file name or path")
+
+        if DISK_RESERVE_BYTES and size + DISK_RESERVE_BYTES > shutil.disk_usage(DATA_DIR).free:
+            return self._error(507, "Not enough free disk space on the server for this file")
+
+        cleanup_stale_uploads()
+        uid = uuid.uuid4().hex
+        now = int(time.time())
+        state = {
+            "upload_id": uid,
+            "path": path,
+            "name": path.split("/")[-1],
+            "size": size,
+            "chunk_size": CHUNK_BYTES,
+            "received": [],
+            "created": now,
+            "updated": now,
+        }
+        try:
+            with _upload_lock:
+                with open(part_path(uid), "wb") as f:
+                    f.truncate(size)  # reserve the full size up front
+                save_upload(state)
+        except OSError as e:
+            remove_upload(uid)
+            status = 507 if e.errno == errno.ENOSPC else 500
+            return self._error(status, "Could not start the upload")
+        self._json(201, upload_view(state))
+
+    def _put_chunk(self, uid, index):
+        state = load_upload(uid)
+        if state is None or state.get("completed"):
+            return self._error(404, "Upload not found")
+
+        if not (0 <= index < total_chunks(state["size"], state["chunk_size"])):
+            return self._error(400, "Chunk number out of range")
+        expected = expected_chunk_len(state, index)
 
         if "Transfer-Encoding" in self.headers:
             return self._error(411, "Content-Length is required")
@@ -321,65 +612,112 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", ""))
         except ValueError:
             return self._error(411, "Content-Length is required")
-        if length < 0:
-            return self._error(400, "Bad request")
-        if length > MAX_UPLOAD_BYTES:
-            return self._error(413, "File is larger than the upload limit")
+        if length != expected:
+            return self._error(400, f"Chunk must be exactly {expected} bytes")
 
-        name = clean_filename(unquote(self.headers.get("X-Filename", "")))
-
-        file_id = uuid.uuid4().hex
-        part_path = os.path.join(FILES_DIR, file_id + ".part")
-        final_path = os.path.join(FILES_DIR, file_id)
-        digest = hashlib.sha256()
-        remaining = length
         try:
-            with open(part_path, "wb") as out:
-                while remaining > 0:
-                    chunk = self.rfile.read(min(CHUNK, remaining))
-                    if not chunk:
-                        break
-                    out.write(chunk)
-                    digest.update(chunk)
-                    remaining -= len(chunk)
+            fd = os.open(part_path(uid), os.O_WRONLY)
+        except FileNotFoundError:
+            return self._error(404, "Upload not found")
+
+        claimed = self.headers.get("X-Chunk-SHA256", "").strip().lower()
+        digest = hashlib.sha256()
+        try:
+            pos = index * state["chunk_size"]
+            remaining = expected
+            while remaining > 0:
+                buf = self.rfile.read(min(IO_BLOCK, remaining))
+                if not buf:
+                    return self._error(400, "Upload was interrupted")
+                digest.update(buf)
+                view = memoryview(buf)
+                written_total = 0
+                while len(view):
+                    written = os.pwrite(fd, view, pos + written_total)
+                    view = view[written:]
+                    written_total += written
+                pos += len(buf)
+                remaining -= len(buf)
+        except OSError as e:
+            status = 507 if e.errno == errno.ENOSPC else 500
+            return self._error(status, "Could not save this part")
+        finally:
+            os.close(fd)
+
+        # The part is only recorded if its bytes match the checksum the browser computed.
+        # A mismatch is not recorded, so the browser sends the part again.
+        if claimed and claimed != digest.hexdigest():
+            return self._error(422, "Part arrived damaged; sending it again")
+
+        with _upload_lock:
+            state = load_upload(uid)
+            if state is None:
+                return self._error(404, "Upload was cancelled")
+            if index not in state["received"]:
+                state["received"].append(index)
+            state["updated"] = int(time.time())
+            save_upload(state)
+        self._json(200, {"ok": True, "received": len(state["received"])})
+
+    def _complete_upload(self, uid):
+        # Step 1: make sure every part has arrived.
+        with _upload_lock:
+            state = load_upload(uid)
+            if state is None:
+                return self._error(404, "Upload not found")
+            if state.get("completed"):  # retry after a lost response
+                return self._json(201, state["completed"])
+            total = total_chunks(state["size"], state["chunk_size"])
+            have = set(state["received"])
+            missing = [i for i in range(total) if i not in have]
+            if missing:
+                return self._json(
+                    409,
+                    {"error": f"{len(missing)} part(s) still missing", "missing": missing[:100]},
+                )
+
+        # Step 2: hash the whole file. This runs outside the lock so other uploads
+        # keep working while a very large file is read back.
+        part = part_path(uid)
+        try:
+            if os.path.getsize(part) != state["size"]:
+                return self._error(500, "Stored size does not match the upload")
+            digest = sha256_of(part)
+        except FileNotFoundError:
+            return self._error(404, "Upload not found")
         except OSError:
-            remaining = -1
+            return self._error(500, "Could not finish the upload")
 
-        if remaining != 0:
-            if os.path.exists(part_path):
-                os.remove(part_path)
-            return self._error(400, "Upload was incomplete")
+        # Step 3: move the file into place and record it.
+        with _upload_lock:
+            state = load_upload(uid)
+            if state is None:
+                return self._error(404, "Upload not found")
+            if state.get("completed"):
+                return self._json(201, state["completed"])
+            file_id = uuid.uuid4().hex
+            try:
+                os.replace(part, os.path.join(FILES_DIR, file_id))
+            except OSError:
+                return self._error(500, "Could not finish the upload")
 
-        os.replace(part_path, final_path)
-        meta = {
-            "id": file_id,
-            "name": name,
-            "size": length,
-            "sha256": digest.hexdigest(),
-            "uploaded_at": int(time.time()),
-        }
-        with _index_lock:
-            index = load_index()
-            index[file_id] = meta
-            save_index(index)
+            meta = {
+                "id": file_id,
+                "name": state["name"],
+                "path": state["path"],
+                "size": state["size"],
+                "sha256": digest,
+                "uploaded_at": int(time.time()),
+            }
+            with _index_lock:
+                index = load_index()
+                index[file_id] = meta
+                save_index(index)
+
+            state["completed"] = meta
+            state["updated"] = int(time.time())
+            save_upload(state)
         self._json(201, meta)
-
-    def do_DELETE(self):
-        if not self._require_auth():
-            return
-        file_id = self._file_id_from_path(urlsplit(self.path).path)
-        if not file_id:
-            return self._error(404, "Not found")
-        with _index_lock:
-            index = load_index()
-            if file_id not in index:
-                return self._error(404, "File not found")
-            del index[file_id]
-            save_index(index)
-        disk_path = os.path.join(FILES_DIR, file_id)
-        if os.path.exists(disk_path):
-            os.remove(disk_path)
-        self._json(200, {"ok": True})
 
 
 def main():
@@ -387,10 +725,20 @@ def main():
         sys.exit("ERROR: APP_PASSWORD is not set. Set it in the environment or .env file.")
     if len(APP_PASSWORD) < 8:
         sys.exit("ERROR: APP_PASSWORD must be at least 8 characters.")
+    if CHUNK_BYTES <= 0:
+        sys.exit("ERROR: CHUNK_MB must be at least 1.")
 
     os.makedirs(FILES_DIR, exist_ok=True)
+    os.makedirs(UPLOADS_DIR, exist_ok=True)
+    cleanup_stale_uploads()
+
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
-    print(f"File store listening on port {PORT}, data in {DATA_DIR}", flush=True)
+    free_gb = shutil.disk_usage(DATA_DIR).free / GB
+    print(
+        f"File store on port {PORT}, data in {DATA_DIR} ({free_gb:.0f} GB free), "
+        f"chunk size {CHUNK_BYTES // MB} MB",
+        flush=True,
+    )
     try:
         server.serve_forever()
     except KeyboardInterrupt:

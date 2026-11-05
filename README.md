@@ -5,28 +5,39 @@ reinstall your PC. Log in, upload your files (zip folders first), and download
 them back later.
 
 - No third-party Python packages (standard library only)
-- Files are kept in a Docker volume (`filestore-data`)
+- Large files (tested in chunks up to hundreds of GB) upload in parts that resume after a dropped connection
+- Downloads resume after an interruption (HTTP Range)
+- Upload whole folders directly, no zip step needed
+- Files are stored byte-for-byte as uploaded, with their names and folder paths unchanged
+- Every part is checksum-verified, and each stored file gets a SHA-256 you can compare with your PC
 - The password comes from an environment variable, never from the code
-- Single-file uploads of any type, with SHA-256 checksums shown in the list
 
 ## Deploy on the server
 
 1. Install Docker and the Docker Compose plugin.
 2. Copy this folder to the server.
-3. Create the config file and set a strong password:
+3. Create the data folder on a disk with plenty of free space, owned by the
+   container user (ID 1000):
+
+   ```bash
+   sudo mkdir -p /srv/filestore
+   sudo chown 1000:1000 /srv/filestore
+   ```
+
+4. Create the config file, then set the password and the `DATA_PATH` above:
 
    ```bash
    cp .env.example .env
-   nano .env        # set APP_PASSWORD (at least 8 characters)
+   nano .env        # set APP_PASSWORD (at least 8 characters) and DATA_PATH
    ```
 
-4. Start it:
+5. Start it:
 
    ```bash
    docker compose up -d --build
    ```
 
-5. Open `http://<server-ip>:8080`, log in, and upload.
+6. Open `http://<server-ip>:8080`, log in, and upload.
 
 Useful commands:
 
@@ -39,11 +50,26 @@ docker compose down -v          # stop AND delete all stored files (careful)
 
 ## Using it
 
-- **Upload:** drag files onto the page or click "Choose files". For a folder,
-  zip it on your PC first (right-click > Send to > Compressed folder on Windows).
-- **Download:** click "Download" next to a file. Check the SHA-256 if you want to
-  confirm the file is intact.
+- **Upload files:** click "Choose files", or drop them on the page.
+- **Upload a folder:** click "Choose folder". The folder structure is kept.
+- **Connection dropped or page closed?** Log in again, choose the same files or
+  folder, and the upload continues from the last sent part. Unfinished uploads
+  are listed on the page. Unfinished uploads with no activity for 72 hours are deleted automatically.
+- **Keep the page open** and keep the PC awake until the upload finishes.
+- **Download:** click "Download". Interrupted downloads resume in most browsers
+  (or use a download manager that supports resuming).
 - **Delete:** click "Delete". This cannot be undone.
+
+## Checking that files are unchanged
+
+Each stored file shows its SHA-256 in the list. To compare with the original on your PC:
+
+- **Windows (PowerShell):** `Get-FileHash "C:\path\to\file" -Algorithm SHA256`
+- **Linux / macOS:** `sha256sum /path/to/file`
+
+Compare the value with the one in the File Store list. They must match exactly.
+The per-part checksums are computed in the browser, which only works over HTTPS or
+`localhost`. Over plain `http://<ip>` the parts still arrive, but the part check is skipped.
 
 ## Security notes
 
@@ -57,15 +83,39 @@ docker compose down -v          # stop AND delete all stored files (careful)
 - Behind a reverse proxy, failed-login limits apply to the proxy's IP, so
   brute-force protection is weaker. Keep the password long.
 
+### If you use a reverse proxy (recommended for HTTPS)
+
+Uploads send 64 MB parts, so the proxy must allow bodies that large and must not
+time out on slow uploads. Examples:
+
+- **Caddy** (`Caddyfile`): no changes needed for uploads; Caddy has no body limit by default.
+  ```
+  files.example.com {
+      reverse_proxy localhost:8080
+  }
+  ```
+- **nginx**: add inside the `server` block:
+  ```
+  client_max_body_size 200m;
+  proxy_request_buffering off;
+  proxy_read_timeout 600s;
+  proxy_send_timeout 600s;
+  ```
+
+Without these, uploads fail with 413 errors or stall.
+
 ## Configuration
 
 | Variable          | Default | Meaning                                         |
 |-------------------|---------|-------------------------------------------------|
 | `APP_PASSWORD`    | (none)  | Required. At least 8 characters.                |
 | `SESSION_SECRET`  | random  | Optional fixed key for login cookies.           |
-| `MAX_UPLOAD_MB`   | 5120    | Largest single file, in MB.                     |
+| `MAX_FILE_GB`     | 0       | Largest single file in GB. 0 = no limit.        |
+| `CHUNK_MB`        | 64      | Size of upload parts. Keep it below 100.        |
+| `DISK_RESERVE_GB` | 0       | If above 0, refuse uploads that leave less free space. |
 | `COOKIE_SECURE`   | 0       | Set to 1 when served over HTTPS.                |
-| `SESSION_TTL_HOURS` | 12    | Hours before you need to log in again.          |
+| `SESSION_TTL_HOURS` | 12    | Idle hours before you need to log in again.     |
+| `DATA_PATH`       | (volume)| Host folder for stored files (in `.env`).       |
 | `HOST_PORT`       | 8080    | Port on the host that maps to the app.          |
 
 ## Running without Docker (for testing)

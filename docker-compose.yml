@@ -8,11 +8,15 @@ services:
     environment:
       APP_PASSWORD: ${APP_PASSWORD:?Set APP_PASSWORD in the .env file}
       SESSION_SECRET: ${SESSION_SECRET:-}
-      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-5120}
       COOKIE_SECURE: ${COOKIE_SECURE:-0}
       SESSION_TTL_HOURS: ${SESSION_TTL_HOURS:-12}
+      MAX_FILE_GB: ${MAX_FILE_GB:-0}
+      CHUNK_MB: ${CHUNK_MB:-64}
+      DISK_RESERVE_GB: ${DISK_RESERVE_GB:-0}
+    # DATA_PATH: a folder on the server with enough free space, e.g. /srv/filestore.
+    # Left empty, Docker keeps the data in a named volume instead.
     volumes:
-      - filestore-data:/data
+      - ${DATA_PATH:-filestore-data}:/data
 
 volumes:
   filestore-data:

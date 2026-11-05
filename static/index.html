@@ -29,12 +29,25 @@
 
       <section class="card">
         <div id="dropzone" class="dropzone" tabindex="0">
-          <p><strong>Drop files here</strong> or</p>
-          <label class="button primary" for="file-input">Choose files</label>
+          <p><strong>Drop files here</strong></p>
+          <div class="button-row">
+            <label class="button primary" for="file-input">Choose files</label>
+            <label class="button primary" for="folder-input">Choose folder</label>
+          </div>
           <input id="file-input" type="file" multiple hidden>
-          <p class="hint">Tip: zip a folder first, then upload the .zip. Max size per file is set by the server.</p>
+          <input id="folder-input" type="file" webkitdirectory hidden>
+          <p class="hint">
+            Large files are sent in parts and resume automatically if the connection drops.
+            Keep this page open until the uploads finish. Folders can be uploaded directly, no zip needed.
+          </p>
         </div>
         <ul id="upload-list" class="upload-list"></ul>
+      </section>
+
+      <section id="unfinished-card" class="card" hidden>
+        <h2>Unfinished uploads</h2>
+        <p class="hint">Choose the same file or folder again to continue where it stopped.</p>
+        <ul id="unfinished-list" class="upload-list"></ul>
       </section>
 
       <section class="card">

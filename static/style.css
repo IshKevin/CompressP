@@ -187,6 +187,20 @@ td.actions { white-space: nowrap; text-align: right; }
 td.actions a,
 td.actions button { margin-left: 6px; padding: 5px 10px; font-size: 0.9rem; }
 
-@media (max-width: 600px) {
-  th:nth-child(4), td.hash { display: none; }
+.row {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  word-break: break-all;
 }
+
+.button-row {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+#unfinished-list li > span { word-break: break-all; }
