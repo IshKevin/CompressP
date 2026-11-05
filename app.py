@@ -569,6 +569,8 @@ class Handler(BaseHTTPRequestHandler):
         path = validate_path(body.get("path") or body.get("name"))
         if path is None:
             return self._error(400, "Invalid file name or path")
+        if not path.lower().endswith(".zip"):
+            return self._error(400, "Only .zip files can be uploaded")
 
         if DISK_RESERVE_BYTES and size + DISK_RESERVE_BYTES > shutil.disk_usage(DATA_DIR).free:
             return self._error(507, "Not enough free disk space on the server for this file")
