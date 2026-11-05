@@ -1,12 +1,18 @@
+# One compose file for both your own machine and Coolify.
+#
+# - Coolify: leave HOST_PORT empty. Docker picks a free host port, and Coolify
+#   routes your domain to the app itself, so the number doesn't matter.
+# - Your machine: set HOST_PORT in .env (e.g. HOST_PORT=8090) to open the app
+#   at http://localhost:8090.
 services:
   filestore:
     build: .
     image: filestore:latest
     restart: unless-stopped
     ports:
-      - "${HOST_PORT:-8080}:8080"
+      - "${HOST_PORT:-}:8080"
     environment:
-      APP_PASSWORD: ${APP_PASSWORD:?Set APP_PASSWORD in the .env file}
+      APP_PASSWORD: ${APP_PASSWORD:?Set APP_PASSWORD in the environment settings}
       SESSION_SECRET: ${SESSION_SECRET:-}
       COOKIE_SECURE: ${COOKIE_SECURE:-0}
       SESSION_TTL_HOURS: ${SESSION_TTL_HOURS:-12}

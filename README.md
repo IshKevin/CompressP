@@ -12,6 +12,19 @@ them back later.
 - Every part is checksum-verified, and each stored file gets a SHA-256 you can compare with your PC
 - The password comes from an environment variable, never from the code
 
+## Deploy with Coolify
+
+1. Create a new resource from this repository (Docker Compose build pack).
+2. In the environment variables, set `APP_PASSWORD` (at least 8 characters).
+   Set `DATA_PATH` only if you want a specific folder, such as `/srv/filestore`.
+3. Under the service, set a domain (for example `files.example.com`) and port `8080`.
+   Coolify then serves it over HTTPS automatically.
+4. Set `COOKIE_SECURE=1` in the environment variables.
+5. Deploy.
+
+Leave `HOST_PORT` empty in Coolify. Coolify then routes your domain to the app, so no
+fixed host port is used and nothing conflicts with other apps on the server.
+
 ## Deploy on the server
 
 1. Install Docker and the Docker Compose plugin.
@@ -28,7 +41,7 @@ them back later.
 
    ```bash
    cp .env.example .env
-   nano .env        # set APP_PASSWORD (at least 8 characters) and DATA_PATH
+   nano .env        # set APP_PASSWORD (at least 8 characters), DATA_PATH and HOST_PORT=8080
    ```
 
 5. Start it:
