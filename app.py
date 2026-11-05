@@ -11,7 +11,8 @@ Environment variables:
   COOKIE_SECURE      1 when served over HTTPS (default 0)
   SESSION_TTL_HOURS  logout after this many idle hours; resets on each request (default 12)
   MAX_FILE_GB        largest allowed single file in GB, 0 = no limit (default 0)
-  CHUNK_MB           upload chunk size in MB (default 64)
+  CHUNK_MB           upload part size in MB (default 8; keep small so each request
+                     finishes before the proxy's ~60 s timeout)
   DISK_RESERVE_GB    if above 0, refuse uploads that would leave less than this free (default 0)
   DATA_DIR           where files and state are stored (default ./data)
   PORT               port to listen on inside the container (default 8080)
@@ -49,7 +50,7 @@ SECRET_KEY = os.environ.get("SESSION_SECRET") or secrets.token_hex(32)
 COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "0") == "1"
 SESSION_TTL = int(os.environ.get("SESSION_TTL_HOURS", "12")) * 3600
 MAX_FILE_BYTES = int(os.environ.get("MAX_FILE_GB", "0")) * GB
-CHUNK_BYTES = int(os.environ.get("CHUNK_MB", "64")) * MB
+CHUNK_BYTES = int(os.environ.get("CHUNK_MB", "8")) * MB
 DISK_RESERVE_BYTES = int(os.environ.get("DISK_RESERVE_GB", "0")) * GB  # 0 = don't check space
 STALE_UPLOAD_SECONDS = 72 * 3600
 PORT = int(os.environ.get("PORT", "8080"))

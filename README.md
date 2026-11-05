@@ -144,7 +144,7 @@ Without these, uploads fail with 413 errors or stall.
 | `APP_PASSWORD`    | (none)  | Required. At least 8 characters.                |
 | `SESSION_SECRET`  | random  | Optional fixed key for login cookies.           |
 | `MAX_FILE_GB`     | 0       | Largest single file in GB. 0 = no limit.        |
-| `CHUNK_MB`        | 64      | Size of upload parts. Keep it below 100.        |
+| `CHUNK_MB`        | 8       | Size of upload parts. Keep at 8 or lower: the proxy times out requests after about 60 s. |
 | `DISK_RESERVE_GB` | 0       | If above 0, refuse uploads that leave less free space. |
 | `COOKIE_SECURE`   | 0       | Set to 1 when served over HTTPS.                |
 | `SESSION_TTL_HOURS` | 12    | Idle hours before you need to log in again.     |

@@ -17,7 +17,7 @@ services:
       COOKIE_SECURE: ${COOKIE_SECURE:-0}
       SESSION_TTL_HOURS: ${SESSION_TTL_HOURS:-12}
       MAX_FILE_GB: ${MAX_FILE_GB:-0}
-      CHUNK_MB: ${CHUNK_MB:-64}
+      CHUNK_MB: ${CHUNK_MB:-8}
       DISK_RESERVE_GB: ${DISK_RESERVE_GB:-0}
     # DATA_PATH: a folder on the server with enough free space, e.g. /srv/filestore.
     # Left empty, Docker keeps the data in a named volume instead.

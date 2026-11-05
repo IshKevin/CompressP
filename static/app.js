@@ -324,7 +324,12 @@
 
     // Resume a matching unfinished upload if there is one.
     const match = unfinished.find((u) => u.path === path && u.size === file.size);
-    if (match) {
+    // An unfinished upload with no parts saved has nothing to resume. Remove it so the
+    // new upload uses the current part size.
+    if (match && match.received.length === 0) {
+      await fetch("/api/uploads/" + match.upload_id + "/abort", { method: "POST", credentials: "same-origin" });
+    }
+    if (match && match.received.length > 0) {
       try {
         const res = await requestWithRetry("/api/uploads/" + match.upload_id, {});
         const state = await res.json();
