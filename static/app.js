@@ -2,6 +2,7 @@
   "use strict";
 
   const RETRY_LIMIT = 6;
+  const PART_CONCURRENCY = 3;
   let uploading = false;
   let unfinished = [];
 
@@ -284,22 +285,39 @@
     for (const i of received) done += partLength(i);
     setProgress(item, done, file.size);
 
-    for (let i = 0; i < totalParts; i++) {
-      if (received.has(i)) continue;
-      const start = i * chunkSize;
-      const end = start + partLength(i);
-      const part = file.slice(start, end);
-      const headers = { "Content-Type": "application/octet-stream" };
-      const checksum = await sha256Hex(part);
-      if (checksum) headers["X-Chunk-SHA256"] = checksum;
-      await requestWithRetry("/api/uploads/" + uploadId + "/chunks/" + i, {
-        method: "POST",
-        headers,
-        body: part,
-      });
-      done += end - start;
-      setProgress(item, done, file.size);
+    // Send several parts at once. One connection is often much slower than the
+    // link allows, so this roughly multiplies throughput on fast connections.
+    const pending = [];
+    for (let i = 0; i < totalParts; i++) if (!received.has(i)) pending.push(i);
+    let next = 0;
+    let failure = null;
+
+    async function sendParts() {
+      while (!failure && next < pending.length) {
+        const i = pending[next++];
+        try {
+          const start = i * chunkSize;
+          const end = start + partLength(i);
+          const part = file.slice(start, end);
+          const headers = { "Content-Type": "application/octet-stream" };
+          const checksum = await sha256Hex(part);
+          if (checksum) headers["X-Chunk-SHA256"] = checksum;
+          await requestWithRetry("/api/uploads/" + uploadId + "/chunks/" + i, {
+            method: "POST",
+            headers,
+            body: part,
+          });
+          done += end - start;
+          setProgress(item, done, file.size);
+        } catch (err) {
+          failure = failure || err;
+          throw err;
+        }
+      }
     }
+
+    const workers = Array.from({ length: Math.min(PART_CONCURRENCY, pending.length) }, sendParts);
+    await Promise.all(workers);
 
     item.status.textContent = "Finishing...";
     await requestWithRetry("/api/uploads/" + uploadId + "/complete", { method: "POST" });
