@@ -12,6 +12,7 @@
   const loginForm = $("#login-form");
   const loginError = $("#login-error");
   const fileInput = $("#file-input");
+  const folderInput = $("#folder-input");
   const dropzone = $("#dropzone");
   const uploadList = $("#upload-list");
   const rows = $("#file-rows");
@@ -415,7 +416,8 @@
     try {
       await loadUnfinished();
       for (const file of files) {
-        const path = file.name;
+        // Folder uploads keep their relative path, e.g. "Photos/2024/a.jpg".
+        const path = file.webkitRelativePath || file.name;
         const item = makeItem(file, path);
         try {
           await uploadOne(file, path, item);
@@ -431,12 +433,14 @@
       uploading = false;
       window.removeEventListener("beforeunload", beforeUnload);
       fileInput.value = "";
+      folderInput.value = "";
       loadFiles();
       loadUnfinished();
     }
   }
 
   fileInput.addEventListener("change", () => uploadFiles(fileInput.files));
+  folderInput.addEventListener("change", () => uploadFiles(folderInput.files));
 
   ["dragenter", "dragover"].forEach((type) =>
     dropzone.addEventListener(type, (e) => {

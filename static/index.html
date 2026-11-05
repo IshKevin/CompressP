@@ -32,10 +32,13 @@
           <p><strong>Drop files here</strong></p>
           <div class="button-row">
             <label class="button primary" for="file-input">Choose files</label>
+            <label class="button primary" for="folder-input">Choose folder</label>
           </div>
           <input id="file-input" type="file" multiple hidden>
+          <input id="folder-input" type="file" webkitdirectory hidden>
           <p class="hint">
-            Any file type works. Zip a folder first if you want to keep it as one file.
+            Any file type works. A folder keeps its files and sub-folders as they are.
+            Zipping a folder first is optional.
             Large files are sent in parts and resume automatically if the connection drops.
             Keep this page open until the uploads finish.
           </p>
