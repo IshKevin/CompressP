@@ -1,0 +1,18 @@
+services:
+  filestore:
+    build: .
+    image: filestore:latest
+    restart: unless-stopped
+    ports:
+      - "${HOST_PORT:-8080}:8080"
+    environment:
+      APP_PASSWORD: ${APP_PASSWORD:?Set APP_PASSWORD in the .env file}
+      SESSION_SECRET: ${SESSION_SECRET:-}
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-5120}
+      COOKIE_SECURE: ${COOKIE_SECURE:-0}
+      SESSION_TTL_HOURS: ${SESSION_TTL_HOURS:-12}
+    volumes:
+      - filestore-data:/data
+
+volumes:
+  filestore-data:

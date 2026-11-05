@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <title>File Store</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <main class="wrap">
+    <h1>File Store</h1>
+
+    <section id="login-view" class="card" hidden>
+      <h2>Log in</h2>
+      <form id="login-form">
+        <label for="password">Password</label>
+        <input id="password" name="password" type="password" autocomplete="current-password" required>
+        <button type="submit" class="primary">Log in</button>
+        <p id="login-error" class="error" role="alert"></p>
+      </form>
+    </section>
+
+    <section id="app-view" hidden>
+      <div class="topbar">
+        <span>Your files</span>
+        <button id="logout-btn" type="button">Log out</button>
+      </div>
+
+      <section class="card">
+        <div id="dropzone" class="dropzone" tabindex="0">
+          <p><strong>Drop files here</strong> or</p>
+          <label class="button primary" for="file-input">Choose files</label>
+          <input id="file-input" type="file" multiple hidden>
+          <p class="hint">Tip: zip a folder first, then upload the .zip. Max size per file is set by the server.</p>
+        </div>
+        <ul id="upload-list" class="upload-list"></ul>
+      </section>
+
+      <section class="card">
+        <div class="list-head">
+          <h2>Stored files</h2>
+          <button id="refresh-btn" type="button">Refresh</button>
+        </div>
+        <p id="list-status" class="hint"></p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>Name</th><th>Size</th><th>Uploaded</th><th>SHA-256</th><th></th></tr>
+            </thead>
+            <tbody id="file-rows"></tbody>
+          </table>
+        </div>
+      </section>
+    </section>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>
