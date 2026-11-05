@@ -84,9 +84,29 @@ Compare the value with the one in the File Store list. They must match exactly.
 The per-part checksums are computed in the browser, which only works over HTTPS or
 `localhost`. Over plain `http://<ip>` the parts still arrive, but the part check is skipped.
 
+## Fast downloads (use this for big files)
+
+A browser downloads over one connection, which is slow for large files. The
+downloader in `tools/fetch.py` uses several connections at once and resumes after a
+dropped connection. It needs only Python 3 on your PC (no packages).
+
+```bash
+# list the stored files
+python tools/fetch.py http://192.168.1.50:8080 --list
+
+# download one file (asks for the password, or set FILESTORE_PASSWORD)
+python tools/fetch.py http://192.168.1.50:8080 "Backups/photos.zip" --out D:\Restore --connections 8
+```
+
+- If it stops, run the same command again. It continues from the last finished part.
+- At the end it checks the SHA-256 against the server's value.
+- Use `--connections 1` to compare with a normal single download.
+
+On Windows PowerShell use `python` instead of `python3`.
+
 ## Security notes
 
-- **Use HTTPS when the server is reachable from the internet.** Put a reverse
+- **On a private network, plain HTTP is fine.** Use HTTPS only when the server is reachable from the internet. Put a reverse
   proxy in front (Caddy, nginx, or Nginx Proxy Manager) with a certificate, then
   set `COOKIE_SECURE=1` in `.env`. Without HTTPS your password travels in plain text.
 - Keep `.env` private. It is in `.gitignore` and `.dockerignore`.

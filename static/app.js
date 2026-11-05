@@ -124,7 +124,7 @@
     rows.textContent = "";
     for (const f of files) {
       const tr = document.createElement("tr");
-      const hash = el("td", "hash", f.sha256 ? f.sha256.slice(0, 12) + "..." : "-");
+      const hash = el("td", "hash", f.sha256 ? f.sha256.slice(0, 12) + "..." : "computing...");
       if (f.sha256) hash.title = f.sha256;
       tr.append(
         el("td", "name", f.path || f.name),
@@ -134,9 +134,9 @@
       );
 
       const actions = el("td", "actions");
-      const dl = el("a", "button", "Download");
-      dl.href = "/api/files/" + encodeURIComponent(f.id);
-      dl.download = f.name;
+      const dl = el("button", "button", "Download");
+      dl.type = "button";
+      dl.addEventListener("click", () => downloadFile(f));
       const del = el("button", "danger", "Delete");
       del.type = "button";
       del.addEventListener("click", () => deleteFile(f));
@@ -144,6 +144,75 @@
 
       tr.append(actions);
       rows.append(tr);
+    }
+  }
+
+  const DOWNLOAD_PART = 64 * 1024 * 1024;
+  const DOWNLOAD_CONCURRENCY = 4;
+
+  // Download a stored file. In Chrome or Edge over HTTPS, several parts are fetched
+  // at once and written straight into the chosen file, which is much faster on fast
+  // links. Other browsers get the normal single-connection download.
+  async function downloadFile(file) {
+    const url = "/api/files/" + encodeURIComponent(file.id);
+    if (!(window.showSaveFilePicker && window.isSecureContext && file.size > 0)) {
+      const a = el("a");
+      a.href = url;
+      a.download = file.name;
+      document.body.append(a);
+      a.click();
+      a.remove();
+      return;
+    }
+
+    let handle;
+    try {
+      handle = await window.showSaveFilePicker({ suggestedName: file.name });
+    } catch (err) {
+      return; // the save dialog was cancelled
+    }
+
+    const writable = await handle.createWritable();
+    const parts = Math.ceil(file.size / DOWNLOAD_PART);
+    let next = 0;
+    let received = 0;
+    let failure = null;
+    listStatus.textContent = "Downloading " + file.name + "...";
+
+    async function fetchPart(i) {
+      const start = i * DOWNLOAD_PART;
+      const end = Math.min(file.size, start + DOWNLOAD_PART) - 1;
+      const res = await requestWithRetry(url, { headers: { Range: "bytes=" + start + "-" + end } });
+      const data = await res.arrayBuffer();
+      if (data.byteLength !== end - start + 1) throw new FatalError("A download part was incomplete");
+      return { start, data };
+    }
+
+    async function worker() {
+      while (!failure && next < parts) {
+        const i = next++;
+        try {
+          const { start, data } = await fetchPart(i);
+          await writable.write({ type: "write", position: start, data });
+          received += data.byteLength;
+          const pct = Math.floor((received / file.size) * 100);
+          listStatus.textContent = "Downloading " + file.name + ": " + pct + "%";
+        } catch (err) {
+          failure = failure || err;
+          throw err;
+        }
+      }
+    }
+
+    try {
+      await Promise.all(Array.from({ length: Math.min(DOWNLOAD_CONCURRENCY, parts) }, worker));
+      await writable.close();
+      listStatus.textContent = "Downloaded " + file.name;
+    } catch (err) {
+      await writable.abort().catch(() => {});
+      if (err instanceof AuthError) return showLogin("Your session expired. Please log in again.");
+      listStatus.textContent = "Download failed.";
+      alert("Download failed: " + (err.message || err));
     }
   }
 

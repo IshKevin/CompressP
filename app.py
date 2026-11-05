@@ -140,6 +140,23 @@ def sha256_of(path):
     return digest.hexdigest()
 
 
+def _hash_stored_file(file_id):
+    """Compute the SHA-256 of a stored file and record it in the index."""
+    try:
+        digest = sha256_of(os.path.join(FILES_DIR, file_id))
+    except OSError:
+        return  # file was deleted in the meantime
+    with _index_lock:
+        index = load_index()
+        if file_id in index:
+            index[file_id]["sha256"] = digest
+            save_index(index)
+
+
+def start_hashing(file_id):
+    threading.Thread(target=_hash_stored_file, args=(file_id,), daemon=True).start()
+
+
 def total_chunks(size, chunk_size):
     return -(-size // chunk_size) if size > 0 else 0
 
@@ -693,28 +710,23 @@ class Handler(BaseHTTPRequestHandler):
                     {"error": f"{len(missing)} part(s) still missing", "missing": missing[:100]},
                 )
 
-        # Step 2: hash the whole file. This runs outside the lock so other uploads
-        # keep working while a very large file is read back.
+        # Step 2: check the size and move the file into place. The checksum is
+        # computed in the background, so this request returns at once even for
+        # very large files (a proxy may cut off a request that runs for minutes).
         part = part_path(uid)
-        try:
-            if os.path.getsize(part) != state["size"]:
-                return self._error(500, "Stored size does not match the upload")
-            digest = sha256_of(part)
-        except FileNotFoundError:
-            return self._error(404, "Upload not found")
-        except OSError:
-            return self._error(500, "Could not finish the upload")
-
-        # Step 3: move the file into place and record it.
         with _upload_lock:
             state = load_upload(uid)
             if state is None:
                 return self._error(404, "Upload not found")
             if state.get("completed"):
                 return self._json(201, state["completed"])
-            file_id = uuid.uuid4().hex
             try:
+                if os.path.getsize(part) != state["size"]:
+                    return self._error(500, "Stored size does not match the upload")
+                file_id = uuid.uuid4().hex
                 os.replace(part, os.path.join(FILES_DIR, file_id))
+            except FileNotFoundError:
+                return self._error(404, "Upload not found")
             except OSError:
                 return self._error(500, "Could not finish the upload")
 
@@ -723,7 +735,7 @@ class Handler(BaseHTTPRequestHandler):
                 "name": state["name"],
                 "path": state["path"],
                 "size": state["size"],
-                "sha256": digest,
+                "sha256": None,  # filled in by the background hashing thread
                 "uploaded_at": int(time.time()),
             }
             with _index_lock:
@@ -734,6 +746,7 @@ class Handler(BaseHTTPRequestHandler):
             state["completed"] = meta
             state["updated"] = int(time.time())
             save_upload(state)
+        start_hashing(file_id)
         self._json(201, meta)
 
 
@@ -748,6 +761,10 @@ def main():
     os.makedirs(FILES_DIR, exist_ok=True)
     os.makedirs(UPLOADS_DIR, exist_ok=True)
     cleanup_stale_uploads()
+    # Files finished just before a restart may still lack a checksum.
+    for file_id, meta in load_index().items():
+        if meta.get("sha256") is None and os.path.isfile(os.path.join(FILES_DIR, file_id)):
+            start_hashing(file_id)
 
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     free_gb = shutil.disk_usage(DATA_DIR).free / GB
